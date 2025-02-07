@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+import select
 import atexit
 import copy
 import io
@@ -31,7 +33,9 @@ from tap_postgres.client import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping, Sequence, Iterable, Mapping
+    from singer_sdk.helpers.types import Context
+
 
 
 REPLICATION_SLOT_PATTERN = "^(?!pg_)[A-Za-z0-9_]{1,63}$"
@@ -76,7 +80,8 @@ class TapPostgres(SQLTap):
             (self.config.get("sqlalchemy_url") is not None)
             or (self.config.get("ssl_enable") is False)
             or (
-                self.config.get("ssl_mode") in {"disable", "allow", "prefer", "require"}
+                self.config.get("ssl_mode") in {
+                    "disable", "allow", "prefer", "require"}
             )
             or (
                 self.config.get("ssl_mode") in {"verify-ca", "verify-full"}
@@ -529,7 +534,8 @@ class TapPostgres(SQLTap):
             signum: The signal number
             frame: The current stack frame
         """
-        sys.exit(1)  # Calling this to be sure atexit is called, so clean_up gets called
+        sys.exit(
+            1)  # Calling this to be sure atexit is called, so clean_up gets called
 
     @property
     def catalog_dict(self) -> dict:
@@ -630,9 +636,73 @@ class TapPostgres(SQLTap):
                 )
             else:
                 streams.append(
-                    PostgresStream(self, catalog_entry, connector=self.connector)
+                    PostgresStream(self, catalog_entry,
+                                   connector=self.connector)
                 )
         return streams
+
+    def get_replication_slot_records(self, context: Context | None) -> Iterable[dict[str, t.Any]]:
+        """Return a generator of row-type dictionary objects."""
+        status_interval = 5.0  # if no records in 5 seconds the tap can exit
+        start_lsn = self.get_starting_replication_key_value(context=context)
+        if start_lsn is None:
+            start_lsn = 0
+        logical_replication_connection = self.logical_replication_connection()
+        logical_replication_cursor = logical_replication_connection.cursor()
+
+        # Flush logs from the previous sync. send_feedback() will only flush LSNs before
+        # the value of flush_lsn, not including the value of flush_lsn, so this is safe
+        # even though we still want logs with an LSN == start_lsn.
+        logical_replication_cursor.send_feedback(flush_lsn=start_lsn)
+
+        # get the slot name from the configuration or use the default value
+        replication_slot_name = self.config.get(
+            "replication_slot_name", "tappostgres")
+
+        logical_replication_cursor.start_replication(
+            slot_name=replication_slot_name,  # use slot name
+            decode=True,
+            start_lsn=start_lsn,
+            status_interval=status_interval,
+            options={
+                "format-version": 2,
+                "include-transaction": False,
+                "add-tables": self.fully_qualified_name,
+            },
+        )
+
+        # Using scaffolding layout from:
+        # https://www.psycopg.org/docs/extras.html#psycopg2.extras.ReplicationCursor
+        while True:
+            message = logical_replication_cursor.read_message()
+            if message:
+                row = self.consume(message, logical_replication_cursor)
+                if row:
+                    yield row
+            else:
+                timeout = (
+                    status_interval
+                    - (
+                        datetime.datetime.now()
+                        - logical_replication_cursor.feedback_timestamp
+                    ).total_seconds()
+                )
+                try:
+                    # If the timeout has passed and the cursor still has no new
+                    # messages, the sync has completed.
+                    if (
+                        select.select(
+                            [logical_replication_cursor], [
+                            ], [], max(0, timeout)
+                        )[0]
+                        == []
+                    ):
+                        break
+                except InterruptedError:
+                    pass
+
+        logical_replication_cursor.close()
+        logical_replication_connection.close()
 
     @final
     def sync_all(self) -> None:
@@ -644,8 +714,10 @@ class TapPostgres(SQLTap):
 
         stream: Stream
         for stream in self.streams.values():
+            self.logger.info(stream)
             if not stream.selected and not stream.has_selected_descendents:
-                self.logger.info("Skipping deselected stream '%s'.", stream.name)
+                self.logger.info(
+                    "Skipping deselected stream '%s'.", stream.name)
                 continue
 
             if stream.parent_stream_type:
