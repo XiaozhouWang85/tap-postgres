@@ -737,7 +737,7 @@ class TapPostgres(SQLTap):
 
         start_lsns = []
         for stream in self.streams.values():
-            start_lsns.append(stream.get_starting_replication_key_value())
+            start_lsns.append(stream.get_starting_replication_key_value(None))
         
         self.logger.info(start_lsns)
 
