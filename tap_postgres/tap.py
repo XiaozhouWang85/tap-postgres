@@ -9,11 +9,14 @@ import copy
 import io
 import signal
 import sys
+
 from functools import cached_property
 from os import chmod, path
 from typing import TYPE_CHECKING, Any, cast, final
 
 import paramiko
+import psycopg2
+from psycopg2 import extras
 from singer_sdk import SQLStream, SQLTap, Stream
 from singer_sdk import typing as th
 from singer_sdk._singerlib import (  # JSON schema typing helpers
@@ -641,9 +644,27 @@ class TapPostgres(SQLTap):
                 )
         return streams
 
-    def get_replication_slot_records(self, context: Context | None) -> Iterable[dict[str, t.Any]]:
+    def logical_replication_connection(self):
+        """A logical replication connection to the database.
+
+        Uses a direct psycopg2 implementation rather than through sqlalchemy.
+        """
+        connection_string = (
+            f"dbname={self.config['database']} "
+            f"user={self.config['user']} "
+            f"password={self.config['password']} "
+            f"host={self.config['host']} "
+            f"port={self.config['port']}"
+        )
+        return psycopg2.connect(
+            connection_string,
+            application_name="tap_postgres",
+            connection_factory=extras.LogicalReplicationConnection,
+        )
+
+    def get_replication_slot_records(self) -> Iterable[dict[str, Any]]:
         """Return a generator of row-type dictionary objects."""
-        status_interval = 5.0  # if no records in 5 seconds the tap can exit
+        status_interval = 30.0  # if no records in 5 seconds the tap can exit
         start_lsn = self.get_starting_replication_key_value(context=context)
         if start_lsn is None:
             start_lsn = 0
@@ -711,10 +732,17 @@ class TapPostgres(SQLTap):
         self._set_compatible_replication_methods()
         if self.state:
             self.write_message(StateMessage(value=self.state))
+        
+        self.logger.info(self.config)
+
+        start_lsns = []
+        for stream in self.streams.values():
+            start_lsns.append(stream.get_starting_replication_key_value())
+        
+        self.logger.info(start_lsns)
 
         stream: Stream
         for stream in self.streams.values():
-            self.logger.info(stream)
             if not stream.selected and not stream.has_selected_descendents:
                 self.logger.info(
                     "Skipping deselected stream '%s'.", stream.name)
