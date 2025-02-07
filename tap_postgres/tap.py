@@ -644,7 +644,7 @@ class TapPostgres(SQLTap):
                 )
         return streams
 
-    def get_replication_slot_records(self) -> Iterable[dict[str, Any]]:
+    def get_replication_slot_records(self) -> Iterable[Any]:
         """Return a generator of row-type dictionary objects."""
         status_interval = 30.0  # if no records in 5 seconds the tap can exit
 
@@ -693,38 +693,37 @@ class TapPostgres(SQLTap):
                 #"add-tables": self.fully_qualified_name,
             },
         )
-
+        all_messages = []
         # Using scaffolding layout from:
         # https://www.psycopg.org/docs/extras.html#psycopg2.extras.ReplicationCursor
-        #while True:
-        #    message = logical_replication_cursor.read_message()
-        #    if message:
-        #        row = self.consume(message, logical_replication_cursor)
-        #        if row:
-        #            yield row
-        #    else:
-        #        timeout = (
-        #            status_interval
-        #            - (
-        #                datetime.datetime.now()
-        #                - logical_replication_cursor.feedback_timestamp
-        #            ).total_seconds()
-        #        )
-        #        try:
-        #            # If the timeout has passed and the cursor still has no new
-        #            # messages, the sync has completed.
-        #            if (
-        #                select.select(
-        #                    [logical_replication_cursor], [
-        #                    ], [], max(0, timeout)
-        #                )[0]
-        #                == []
-        #            ):
-        #                break
-        #        except InterruptedError:
-        #            pass
+        while True:
+            message = logical_replication_cursor.read_message()
+            if message:
+                all_messages.append(message)
+            else:
+                timeout = (
+                    status_interval
+                    - (
+                        datetime.datetime.now()
+                        - logical_replication_cursor.feedback_timestamp
+                    ).total_seconds()
+                )
+                try:
+                    # If the timeout has passed and the cursor still has no new
+                    # messages, the sync has completed.
+                    if (
+                        select.select(
+                            [logical_replication_cursor], [
+                            ], [], max(0, timeout)
+                        )[0]
+                        == []
+                    ):
+                        break
+                except InterruptedError:
+                    pass
         logical_replication_cursor.close()
         logical_replication_connection.close()
+        return all_messages
 
     @final
     def sync_all(self) -> None:
@@ -736,6 +735,7 @@ class TapPostgres(SQLTap):
         
         self.logger.info(self.config)
         asdf = self.get_replication_slot_records()
+        self.logger.info(asdf)
         stream: Stream
         for stream in self.streams.values():
             if not stream.selected and not stream.has_selected_descendents:
