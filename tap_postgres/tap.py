@@ -644,11 +644,21 @@ class TapPostgres(SQLTap):
                 )
         return streams
 
-    def logical_replication_connection(self):
-        """A logical replication connection to the database.
+    def get_replication_slot_records(self) -> Iterable[dict[str, Any]]:
+        """Return a generator of row-type dictionary objects."""
+        status_interval = 30.0  # if no records in 5 seconds the tap can exit
 
-        Uses a direct psycopg2 implementation rather than through sqlalchemy.
-        """
+        all_start_lsns = [
+            stream.get_starting_replication_key_value(None)
+            for stream in self.streams.values()
+        ]
+        start_lsn = min(
+            [num for num in all_start_lsns if num is not None],
+            default=0
+        )
+
+        self.logger.info(start_lsn)
+
         connection_string = (
             f"dbname={self.config['database']} "
             f"user={self.config['user']} "
@@ -656,19 +666,11 @@ class TapPostgres(SQLTap):
             f"host={self.config['host']} "
             f"port={self.config['port']}"
         )
-        return psycopg2.connect(
+        logical_replication_connection = psycopg2.connect(
             connection_string,
             application_name="tap_postgres",
             connection_factory=extras.LogicalReplicationConnection,
         )
-
-    def get_replication_slot_records(self) -> Iterable[dict[str, Any]]:
-        """Return a generator of row-type dictionary objects."""
-        status_interval = 30.0  # if no records in 5 seconds the tap can exit
-        start_lsn = self.get_starting_replication_key_value(context=context)
-        if start_lsn is None:
-            start_lsn = 0
-        logical_replication_connection = self.logical_replication_connection()
         logical_replication_cursor = logical_replication_connection.cursor()
 
         # Flush logs from the previous sync. send_feedback() will only flush LSNs before
@@ -688,40 +690,39 @@ class TapPostgres(SQLTap):
             options={
                 "format-version": 2,
                 "include-transaction": False,
-                "add-tables": self.fully_qualified_name,
+                #"add-tables": self.fully_qualified_name,
             },
         )
 
         # Using scaffolding layout from:
         # https://www.psycopg.org/docs/extras.html#psycopg2.extras.ReplicationCursor
-        while True:
-            message = logical_replication_cursor.read_message()
-            if message:
-                row = self.consume(message, logical_replication_cursor)
-                if row:
-                    yield row
-            else:
-                timeout = (
-                    status_interval
-                    - (
-                        datetime.datetime.now()
-                        - logical_replication_cursor.feedback_timestamp
-                    ).total_seconds()
-                )
-                try:
-                    # If the timeout has passed and the cursor still has no new
-                    # messages, the sync has completed.
-                    if (
-                        select.select(
-                            [logical_replication_cursor], [
-                            ], [], max(0, timeout)
-                        )[0]
-                        == []
-                    ):
-                        break
-                except InterruptedError:
-                    pass
-
+        #while True:
+        #    message = logical_replication_cursor.read_message()
+        #    if message:
+        #        row = self.consume(message, logical_replication_cursor)
+        #        if row:
+        #            yield row
+        #    else:
+        #        timeout = (
+        #            status_interval
+        #            - (
+        #                datetime.datetime.now()
+        #                - logical_replication_cursor.feedback_timestamp
+        #            ).total_seconds()
+        #        )
+        #        try:
+        #            # If the timeout has passed and the cursor still has no new
+        #            # messages, the sync has completed.
+        #            if (
+        #                select.select(
+        #                    [logical_replication_cursor], [
+        #                    ], [], max(0, timeout)
+        #                )[0]
+        #                == []
+        #            ):
+        #                break
+        #        except InterruptedError:
+        #            pass
         logical_replication_cursor.close()
         logical_replication_connection.close()
 
@@ -734,13 +735,7 @@ class TapPostgres(SQLTap):
             self.write_message(StateMessage(value=self.state))
         
         self.logger.info(self.config)
-
-        start_lsns = []
-        for stream in self.streams.values():
-            start_lsns.append(stream.get_starting_replication_key_value(None))
-        
-        self.logger.info(start_lsns)
-
+        asdf = self.get_replication_slot_records()
         stream: Stream
         for stream in self.streams.values():
             if not stream.selected and not stream.has_selected_descendents:
