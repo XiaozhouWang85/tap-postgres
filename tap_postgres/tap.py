@@ -9,7 +9,7 @@ import signal
 import sys
 from functools import cached_property
 from os import chmod, path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, final
 
 import paramiko
 from singer_sdk import SQLStream, SQLTap, Stream
@@ -18,6 +18,7 @@ from singer_sdk._singerlib import (  # JSON schema typing helpers
     Catalog,
     Metadata,
     Schema,
+    StateMessage
 )
 from sqlalchemy.engine import URL
 from sqlalchemy.engine.url import make_url
@@ -632,3 +633,35 @@ class TapPostgres(SQLTap):
                     PostgresStream(self, catalog_entry, connector=self.connector)
                 )
         return streams
+
+    @final
+    def sync_all(self) -> None:
+        """Sync all streams."""
+        self._reset_state_progress_markers()
+        self._set_compatible_replication_methods()
+        if self.state:
+            self.write_message(StateMessage(value=self.state))
+
+        stream: Stream
+        for stream in self.streams.values():
+            if not stream.selected and not stream.has_selected_descendents:
+                self.logger.info("Skipping deselected stream '%s'.", stream.name)
+                continue
+
+            if stream.parent_stream_type:
+                self.logger.debug(
+                    "Child stream '%s' is expected to be called "
+                    "by parent stream '%s'. "
+                    "Skipping direct invocation.",
+                    type(stream).__name__,
+                    stream.parent_stream_type.__name__,
+                )
+                continue
+
+            stream.sync()
+            stream.finalize_state_progress_markers()
+
+        # this second loop is needed for all streams to print out their costs
+        # including child streams which are otherwise skipped in the loop above
+        for stream in self.streams.values():
+            stream.log_sync_costs()
